@@ -287,6 +287,89 @@ class RescanPlanResponse(BaseModel):
     )
 
 
+class AlignFrameIn(BaseModel):
+    id: str = Field(..., description="帧 ID：序列内唯一的字符串")
+    image_hash: str = Field(
+        ...,
+        min_length=16,
+        max_length=16,
+        pattern=r"^[0-9a-fA-F]{16}$",
+        description="16 位十六进制图像哈希（64 bit，由调用方提供）",
+    )
+
+
+class ScanAlignmentRequest(BaseModel):
+    left: list[AlignFrameIn] = Field(
+        ..., max_length=100, description="左序列（第一次扫描），0～100 帧，按扫描顺序"
+    )
+    right: list[AlignFrameIn] = Field(
+        ..., max_length=100, description="右序列（第二次扫描），0～100 帧，按扫描顺序"
+    )
+    match_threshold: int = Field(
+        ..., ge=0, le=64, description="允许配对的最大哈希汉明距离，0～64"
+    )
+    gap_open_cost: int = Field(
+        ..., ge=1, le=100, description="每开启一个连续 L/R 段的固定成本，1～100"
+    )
+    gap_per_frame_cost: int = Field(
+        ..., ge=1, le=100, description="L/R 段内每帧的成本，1～100"
+    )
+
+
+class AlignStepOut(BaseModel):
+    index: int = Field(..., description="操作序号，从 1 开始")
+    operation: Literal["M", "L", "R"] = Field(
+        ..., description="M=左右配对；L=仅左帧；R=仅右帧"
+    )
+    left_id: Union[str, None] = Field(
+        ..., description="该步取到的左序列帧 ID；operation=R 时为 null"
+    )
+    right_id: Union[str, None] = Field(
+        ..., description="该步取到的右序列帧 ID；operation=L 时为 null"
+    )
+    distance: Union[int, None] = Field(
+        ..., description="配对两帧哈希的汉明距离；仅 operation=M 时非空"
+    )
+
+
+class AlignGapSegmentOut(BaseModel):
+    side: Literal["L", "R"] = Field(..., description="段所在的侧")
+    start_step: int = Field(..., description="段内首个操作的序号（含）")
+    end_step: int = Field(..., description="段内最后一个操作的序号（含）")
+    length: int = Field(..., description="段长（帧数）")
+    open_cost: int = Field(..., description="开段成本")
+    per_frame_cost: int = Field(..., description="逐帧成本")
+    cost: int = Field(..., description="段成本 = open_cost + length × per_frame_cost")
+    ids: list[str] = Field(..., description="段内帧 ID，按操作顺序")
+
+
+class ScanAlignmentResponse(BaseModel):
+    left_frame_count: int
+    right_frame_count: int
+    match_threshold: int
+    gap_open_cost: int
+    gap_per_frame_cost: int
+    operations: str = Field(
+        ...,
+        description="完整操作串（M/L/R），与 steps 一一对应；两侧均为空时为空串",
+    )
+    step_count: int = Field(..., description="操作步数 = 左帧数 + 右帧数 - 配对数")
+    match_count: int = Field(..., description="配对（M）次数")
+    left_only_count: int = Field(..., description="仅左（L）帧数")
+    right_only_count: int = Field(..., description="仅右（R）帧数")
+    steps: list[AlignStepOut] = Field(
+        ..., description="逐步操作、对应帧 ID 与配对距离；双空序列时为空数组"
+    )
+    gap_segments: list[AlignGapSegmentOut] = Field(
+        ..., description="连续 L/R 段明细（M 切断段、换侧另开段），按起始步升序"
+    )
+    match_cost_total: int = Field(..., description="全部配对的汉明距离之和")
+    gap_cost_total: int = Field(..., description="全部 L/R 段成本之和")
+    total_cost: int = Field(
+        ..., description="全局最低总成本 = match_cost_total + gap_cost_total"
+    )
+
+
 class ConflictingConfirmationOut(BaseModel):
     position: int = Field(..., description="冲突确认所在的扫描顺序位置，从 1 开始")
     frame_number: int = Field(..., description="该位置被人工确认的帧号")

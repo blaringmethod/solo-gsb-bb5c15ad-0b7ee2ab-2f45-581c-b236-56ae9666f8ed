@@ -78,7 +78,6 @@ from collections import deque
 from decimal import Decimal
 from typing import Any
 
-
 # ---- 代价常量 ----
 INFER_COST = Decimal("100")        # 未命中任何候选时的推断代价
 MISSING_FRAME_PENALTY = 30         # 每缺 1 帧的额外代价
@@ -1362,4 +1361,363 @@ def solve_rescan_plan(payload: dict[str, Any]) -> dict[str, Any]:
         "window_count": len(result_windows),
         "total_cost": _json_number(total_cost),
         "windows": result_windows,
+    }
+
+
+# ---- 双扫描序列对齐 ----
+#
+# 问题：同一卷胶片两次扫描，分别得到按扫描顺序排列的左右两序列（0～100
+# 帧），每帧给出序列内唯一的字符串 ID 与 16 位十六进制图像哈希（由调用方
+# 提供，本服务不重新计算）。要在保持各自原序的前提下对齐，每一步是：
+#
+#   M：左右各取一帧配对，仅当两帧哈希的汉明距离 <= 阈值，代价 = 距离；
+#   L：仅取左帧（右序列缺帧）；
+#   R：仅取右帧（左序列缺帧）。
+#
+# 每帧恰好出现一次。连续的 L（或连续的 R）构成一个段，每段成本 =
+# 开段成本 + 段长 × 逐帧成本；配对 M 不属任何侧，M 之后再出现 L/R 需
+# 重新开段，L、R 之间换侧同样另开新段。求全局最低成本，同分时按操作串
+# 字典序 M < L < R 裁决。
+#
+# 这是带“仿射空隙代价”的序列对齐：状态为当前格 (i, j) 及最后一步的侧
+# （0=M，1=L，2=R），从同状态续段只付逐帧成本，从异状态进入 L/R 需另付
+# 开段成本。每个 DP 状态保存 (成本, 操作串字节)：字节按 M=0、L=1、R=2
+# 编码，使 Python 元组/字节串的自然字典序恰好等价于裁决序 M < L < R。
+# 三条终态的 (成本, 操作串) 直接取最小即为全局答案。
+
+
+# 双扫描对齐的业务边界
+MIN_ALIGN_SIDE_FRAMES = 0
+MAX_ALIGN_SIDE_FRAMES = 100
+MIN_ALIGN_THRESHOLD = 0
+MAX_ALIGN_THRESHOLD = 64
+MIN_ALIGN_SEGMENT_COST = 1
+MAX_ALIGN_SEGMENT_COST = 100
+HASH_HEX_LENGTH = 16  # 16 个十六进制字符 = 64 bit
+
+# 操作编码：字节值同时充当字典序裁决权重（M < L < R）
+_OP_M = 0
+_OP_L = 1
+_OP_R = 2
+_OP_BYTES = {_OP_M: ord("M"), _OP_L: ord("L"), _OP_R: ord("R")}
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
+
+def _parse_align_side(raw: Any, side_label: str) -> list[tuple[str, int]]:
+    """校验并解析一侧扫描序列，返回 [(id, 哈希整数)]，保持输入顺序。"""
+    if not isinstance(raw, list) or not (
+        MIN_ALIGN_SIDE_FRAMES <= len(raw) <= MAX_ALIGN_SIDE_FRAMES
+    ):
+        raise InvalidRangeError(
+            f"{side_label} 帧数必须在 "
+            f"{MIN_ALIGN_SIDE_FRAMES}～{MAX_ALIGN_SIDE_FRAMES} 之间"
+        )
+
+    seen: set[str] = set()
+    parsed: list[tuple[str, int]] = []
+    for idx, frame in enumerate(raw):
+        label = f"{side_label}第 {idx + 1} 帧"
+        if not isinstance(frame, dict):
+            raise InvalidRangeError(f"{label}格式不正确，需包含 id 与 image_hash")
+        frame_id = frame.get("id")
+        if not isinstance(frame_id, str):
+            raise InvalidRangeError(f"{label}的 id 必须是字符串")
+        if frame_id in seen:
+            raise InvalidRangeError(
+                f"{side_label}存在重复 id：{frame_id!r}（id 在本序列内必须唯一）"
+            )
+        image_hash = frame.get("image_hash")
+        if not isinstance(image_hash, str) or len(image_hash) != HASH_HEX_LENGTH:
+            raise InvalidRangeError(
+                f"帧 {frame_id!r} 的 image_hash 必须是 {HASH_HEX_LENGTH} 位十六进制字符串"
+            )
+        if any(ch not in _HEX_DIGITS for ch in image_hash):
+            raise InvalidRangeError(
+                f"帧 {frame_id!r} 的 image_hash 含有非十六进制字符（仅允许 0-9/a-f/A-F）"
+            )
+        seen.add(frame_id)
+        parsed.append((frame_id, int(image_hash, 16)))
+    return parsed
+
+
+def _validate_align_costs(payload: dict[str, Any]) -> tuple[int, int, int]:
+    """校验阈值、开段成本与逐帧成本，返回 (threshold, open_cost, per_frame_cost)。"""
+    threshold = payload.get("match_threshold")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not (
+        MIN_ALIGN_THRESHOLD <= threshold <= MAX_ALIGN_THRESHOLD
+    ):
+        raise InvalidRangeError(
+            f"match_threshold 必须是 "
+            f"{MIN_ALIGN_THRESHOLD}～{MAX_ALIGN_THRESHOLD} 的整数"
+        )
+
+    open_cost = payload.get("gap_open_cost")
+    if not isinstance(open_cost, int) or isinstance(open_cost, bool) or not (
+        MIN_ALIGN_SEGMENT_COST <= open_cost <= MAX_ALIGN_SEGMENT_COST
+    ):
+        raise InvalidRangeError(
+            f"gap_open_cost 必须是 "
+            f"{MIN_ALIGN_SEGMENT_COST}～{MAX_ALIGN_SEGMENT_COST} 的整数"
+        )
+
+    per_frame_cost = payload.get("gap_per_frame_cost")
+    if (
+        not isinstance(per_frame_cost, int)
+        or isinstance(per_frame_cost, bool)
+        or not (MIN_ALIGN_SEGMENT_COST <= per_frame_cost <= MAX_ALIGN_SEGMENT_COST)
+    ):
+        raise InvalidRangeError(
+            f"gap_per_frame_cost 必须是 "
+            f"{MIN_ALIGN_SEGMENT_COST}～{MAX_ALIGN_SEGMENT_COST} 的整数"
+        )
+    return threshold, open_cost, per_frame_cost
+
+
+def _align_dp(
+    left: list[tuple[str, int]],
+    right: list[tuple[str, int]],
+    threshold: int,
+    open_cost: int,
+    per_frame_cost: int,
+) -> tuple[int, bytes]:
+    """带仿射空隙代价的序列对齐，返回 (最低成本, 按 M=0/L=1/R=2 编码的操作串)。
+
+    dp[i][j] 为三元组 (到 M 状态, 到 L 状态, 到 R 状态) 的最优键
+    (成本, 操作串字节)；None 表示不可达。滚动保存两行。
+    """
+    n = len(left)
+    m = len(right)
+
+    # dist[i][j]：左第 i 帧与右第 j 帧的汉明距离；超过阈值的配对不可行，
+    # 记为 None，避免在 DP 内重复计算。
+    dist: list[list[int | None]] = [[None] * m for _ in range(n)]
+    for i in range(n):
+        left_hash = left[i][1]
+        for j in range(m):
+            distance = (left_hash ^ right[j][1]).bit_count()
+            if distance <= threshold:
+                dist[i][j] = distance
+
+    def better(
+        incumbent: tuple[int, bytes] | None,
+        candidate: tuple[int, bytes],
+    ) -> tuple[int, bytes]:
+        """按 (成本, 操作串) 取优；字节编码使自然序等于 M < L < R。"""
+        if incumbent is None or candidate < incumbent:
+            return candidate
+        return incumbent
+
+    # prev[j] 对应格 (i-1, j)，cur[j] 对应格 (i, j)。
+    prev: list[tuple] = [(None, None, None)] * (m + 1)
+    # 空对齐的起点：0 成本、空操作串，视作 M 状态（其后首个 L/R 都需开段）。
+    prev[0] = ((0, b""), None, None)
+    for j in range(1, m + 1):
+        # 顶边：只能连续 R；第一段也要付开段成本
+        cost = open_cost + j * per_frame_cost
+        prev[j] = (None, None, (cost, bytes([_OP_R]) * j))
+
+    for i in range(1, n + 1):
+        cur: list[tuple] = [(None, None, None)] * (m + 1)
+        # 左边：只能连续 L；第一段也要付开段成本
+        cur[0] = (
+            None,
+            (open_cost + i * per_frame_cost, bytes([_OP_L]) * i),
+            None,
+        )
+        for j in range(1, m + 1):
+            p_diag = prev[j - 1]  # 格 (i-1, j-1)
+            p_up = prev[j]        # 格 (i-1, j)，进入 L
+            p_left = cur[j - 1]   # 格 (i, j-1)，进入 R
+
+            # M：三种前驱均可；M 自身不续任何侧段，无开段费用
+            state_m: tuple[int, bytes] | None = None
+            distance = dist[i - 1][j - 1]
+            if distance is not None:
+                for prev_key in p_diag:
+                    if prev_key is not None:
+                        state_m = better(
+                            state_m,
+                            (prev_key[0] + distance, prev_key[1] + bytes([_OP_M])),
+                        )
+
+            # L：从 L 续段只付逐帧成本；从 M/R 进入则需另开新段
+            state_l: tuple[int, bytes] | None = None
+            for state, prev_key in enumerate(p_up):
+                if prev_key is None:
+                    continue
+                added = per_frame_cost if state == _OP_L else open_cost + per_frame_cost
+                state_l = better(
+                    state_l,
+                    (prev_key[0] + added, prev_key[1] + bytes([_OP_L])),
+                )
+
+            # R：从 R 续段只付逐帧成本；从 M/L 进入则需另开新段
+            state_r: tuple[int, bytes] | None = None
+            for state, prev_key in enumerate(p_left):
+                if prev_key is None:
+                    continue
+                added = per_frame_cost if state == _OP_R else open_cost + per_frame_cost
+                state_r = better(
+                    state_r,
+                    (prev_key[0] + added, prev_key[1] + bytes([_OP_R])),
+                )
+
+            cur[j] = (state_m, state_l, state_r)
+        prev = cur
+
+    final_key: tuple[int, bytes] | None = None
+    for state_key in prev[m]:
+        if state_key is not None:
+            final_key = better(final_key, state_key)
+    assert final_key is not None, "任意两序列恒可全 L/全 R 对齐，终态必可达"
+    return final_key
+
+
+def solve_scan_alignment(payload: dict[str, Any]) -> dict[str, Any]:
+    """比对同卷胶片的两次扫描，求最低成本的原序对齐。
+
+    入参字段：
+        left / right: [{id: str, image_hash: 16 位十六进制字符串}]，
+                      各 0～100 帧，id 在本序列内唯一
+        match_threshold: int，0～64，允许配对的最大哈希汉明距离
+        gap_open_cost: int，1～100，每开启一个连续 L/R 段的固定成本
+        gap_per_frame_cost: int，1～100，段内每帧的成本
+
+    配对代价为哈希汉明距离；连续 L 或连续 R 段成本 = 开段成本 +
+    段长 × 逐帧成本，M 之后或换侧都需重新开段。返回完整操作串、逐步
+    对应 ID 与配对距离、L/R 段明细及总成本；同分按操作串字典序
+    M < L < R 裁决。两侧均为空时返回空操作与零成本。参数不合法时抛
+    InvalidRangeError（HTTP 422）。
+    """
+    left = _parse_align_side(payload.get("left"), "left")
+    right = _parse_align_side(payload.get("right"), "right")
+    threshold, open_cost, per_frame_cost = _validate_align_costs(payload)
+
+    dp_cost, op_codes = _align_dp(left, right, threshold, open_cost, per_frame_cost)
+
+    # ---- 回溯：按操作串推进两侧游标，组装逐步结果 ----
+    steps: list[dict[str, Any]] = []
+    li = rj = 0
+    operations_chars: list[str] = []
+    match_cost_total = 0
+    for code in op_codes:
+        if code == _OP_M:
+            left_id = left[li][0]
+            right_id = right[rj][0]
+            distance = (left[li][1] ^ right[rj][1]).bit_count()
+            match_cost_total += distance
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "operation": "M",
+                    "left_id": left_id,
+                    "right_id": right_id,
+                    "distance": distance,
+                }
+            )
+            li += 1
+            rj += 1
+            operations_chars.append("M")
+        elif code == _OP_L:
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "operation": "L",
+                    "left_id": left[li][0],
+                    "right_id": None,
+                    "distance": None,
+                }
+            )
+            li += 1
+            operations_chars.append("L")
+        else:
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "operation": "R",
+                    "left_id": None,
+                    "right_id": right[rj][0],
+                    "distance": None,
+                }
+            )
+            rj += 1
+            operations_chars.append("R")
+
+    assert li == len(left) and rj == len(right), "对齐未覆盖全部输入帧"
+
+    # ---- 从操作串提取连续 L/R 段（M 切断段，换侧另开段）----
+    gap_segments: list[dict[str, Any]] = []
+    seg_side: str | None = None
+    seg_start = 0
+    for idx, op in enumerate(operations_chars):
+        if seg_side is not None and op != seg_side:
+            # 遇到 M 或换侧：当前段在 idx 处结束
+            gap_segments.append(
+                _build_gap_segment(
+                    steps, seg_side, seg_start, idx, open_cost, per_frame_cost
+                )
+            )
+            seg_side = None
+        if op in ("L", "R") and seg_side is None:
+            seg_side = op
+            seg_start = idx
+    if seg_side is not None:
+        gap_segments.append(
+            _build_gap_segment(
+                steps,
+                seg_side,
+                seg_start,
+                len(operations_chars),
+                open_cost,
+                per_frame_cost,
+            )
+        )
+
+    gap_cost_total = sum(segment["cost"] for segment in gap_segments)
+    total_cost = match_cost_total + gap_cost_total
+
+    assert total_cost == dp_cost, "段明细重建的总成本与 DP 最优成本不一致"
+
+    return {
+        "left_frame_count": len(left),
+        "right_frame_count": len(right),
+        "match_threshold": threshold,
+        "gap_open_cost": open_cost,
+        "gap_per_frame_cost": per_frame_cost,
+        "operations": "".join(operations_chars),
+        "step_count": len(steps),
+        "match_count": sum(1 for op in operations_chars if op == "M"),
+        "left_only_count": sum(1 for op in operations_chars if op == "L"),
+        "right_only_count": sum(1 for op in operations_chars if op == "R"),
+        "steps": steps,
+        "gap_segments": gap_segments,
+        "match_cost_total": match_cost_total,
+        "gap_cost_total": gap_cost_total,
+        "total_cost": total_cost,
+    }
+
+
+def _build_gap_segment(
+    steps: list[dict[str, Any]],
+    side: str,
+    start: int,
+    end: int,
+    open_cost: int,
+    per_frame_cost: int,
+) -> dict[str, Any]:
+    """把 steps[start:end]（同一侧的连续 L/R）组装成段明细。"""
+    segment_steps = steps[start:end]
+    length = len(segment_steps)
+    return {
+        "side": side,
+        "start_step": start + 1,
+        "end_step": end,
+        "length": length,
+        "open_cost": open_cost,
+        "per_frame_cost": per_frame_cost,
+        "cost": open_cost + length * per_frame_cost,
+        "ids": [
+            step["left_id"] if side == "L" else step["right_id"]
+            for step in segment_steps
+        ],
     }

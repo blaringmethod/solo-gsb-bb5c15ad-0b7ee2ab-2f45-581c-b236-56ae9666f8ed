@@ -27,10 +27,19 @@
 （未命中候选的确认帧仍按推断计价），在确认约束下求最低代价指派；确认
 本身导致无解时返回 HTTP `422` 与按位置升序、不可再删减的冲突确认集。
 
+另有双扫描对齐接口：比对**同一卷胶片的两次扫描**。左右序列各 0～100 帧，
+每帧给出序列内唯一的字符串 ID 与 16 位十六进制图像哈希（哈希由调用方
+提供，服务不重新计算）。在保持各自原序的前提下把两序列对齐为
+**配对 M / 仅左 L / 仅右 R** 三种操作：配对仅允许哈希汉明距离不超过
+阈值（代价 = 距离），连续 L 或连续 R 段按**开段成本 + 段长 × 逐帧成本**
+计费（M 之后或换侧都需重新开段），求**全局最低成本**对齐，同分按操作串
+字典序 `M < L < R` 裁决。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
   + 复扫窗口划分动态规划 + 最优路径 DAG 分叉-汇合区间的最小命中集
   + 人工确认约束下的同一 DP（钉死位置 + 升序删减求冲突确认集）
+  + 双扫描对齐的仿射空隙代价动态规划（按最后一步侧别分状态，操作串字典序裁决）
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -41,11 +50,12 @@
 docker compose up --build -d
 ```
 
-一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`（即访问地址 `http://localhost:8000`）。启动后可直接使用六个接口：
+一条命令即完成镜像构建、依赖安装、后台启动与健康检查注册，容器内、外
+端口均为 `8000`（即访问地址 `http://localhost:8000`）。服务无需任何
+环境变量或外部配置，启动完成后即可直接使用七个接口：
 
 - API 地址（基址）：`http://localhost:8000`
-- 交互式文档（Swagger UI，六个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，七个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
 - 人工确认复核：`POST http://localhost:8000/api/v1/confirmed-frame-reviews`
@@ -53,6 +63,7 @@ docker compose up --build -d
 - 人工核验计划：`POST http://localhost:8000/api/v1/verification-plans`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
+- 双扫描对齐：`POST http://localhost:8000/api/v1/scan-alignments`
 
 停止服务：
 
@@ -71,6 +82,7 @@ docker compose down
 | `POST` | `/api/v1/verification-plans` | 人工核验计划：锁定基准指派所需的最少核验帧 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
+| `POST` | `/api/v1/scan-alignments` | 双扫描对齐：同卷胶片两次扫描的最低成本原序对齐 |
 
 ### `POST /api/v1/frame-reviews`
 
@@ -773,6 +785,104 @@ curl -s -X POST http://localhost:8000/api/v1/rescan-plans \
 - `total_cost`：全部窗口成本之和；无复扫目标时 `windows` 为空、
   `total_cost` 为 `0`。
 
+### `POST /api/v1/scan-alignments`
+
+比对同一卷胶片的两次扫描：把左右两个扫描序列在**各自保持原序**的前提下
+对齐，使总成本最低。哈希由调用方提供，本接口不重新计算图像哈希。
+
+#### 请求参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `left` | 数组 | 左序列（第一次扫描），**0～100 帧**，按扫描顺序 |
+| `right` | 数组 | 右序列（第二次扫描），**0～100 帧**，按扫描顺序 |
+| `left[].id` / `right[].id` | string | 帧 ID，**在本序列内唯一** |
+| `left[].image_hash` / `right[].image_hash` | string | **16 位十六进制**图像哈希（64 bit，大小写均可） |
+| `match_threshold` | int | 允许配对的最大哈希汉明距离，**0～64** |
+| `gap_open_cost` | int | 每开启一个连续 L/R 段的固定成本，**1～100** |
+| `gap_per_frame_cost` | int | L/R 段内每帧的成本，**1～100** |
+
+#### 对齐规则与成本
+
+- 每步操作为三种之一：**M**（左右各取一帧配对）、**L**（仅取左帧）、
+  **R**（仅取右帧）；两序列的每帧都恰好出现一次，且各自保持输入顺序；
+- 配对仅当两帧哈希的**汉明距离 ≤ `match_threshold`** 时允许，该步代价
+  = 汉明距离；
+- 连续的 L（或连续的 R）构成一个**段**：段成本 =
+  `gap_open_cost + 段长 × gap_per_frame_cost`；M 不属于任何侧，M 之后
+  再出现 L/R 需重新开段，L、R 之间**换侧同样另开新段**；
+- 取**总成本最低**的对齐；同分时按**操作串字典序 `M < L < R`** 裁决；
+- 两侧均为空序列时返回空操作串与零成本；
+- 参数非法（帧数越界、ID 重复、哈希不是 16 位十六进制、阈值/成本超范围
+  等）返回 HTTP `422`。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/scan-alignments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "left": [
+      {"id": "scanA-01", "image_hash": "0000000000000000"},
+      {"id": "scanA-02", "image_hash": "0000000000000001"},
+      {"id": "scanA-03", "image_hash": "aaaaaaaaaaaaaaaa"}
+    ],
+    "right": [
+      {"id": "scanB-01", "image_hash": "0000000000000000"},
+      {"id": "scanB-02", "image_hash": "0000000000000003"},
+      {"id": "scanB-03", "image_hash": "ffffffffffffffff"}
+    ],
+    "match_threshold": 4,
+    "gap_open_cost": 5,
+    "gap_per_frame_cost": 2
+  }'
+```
+
+#### 响应示例
+
+`scanA-01`/`scanB-01` 完全相同（距离 0），`scanA-02`/`scanB-02` 差 1 位
+（距离 1 ≤ 阈值 4），`scanA-03` 与 `scanB-03` 与任何对侧帧的距离都超过
+阈值，各自落为一个单帧段（成本各 `5 + 1×2 = 7`）：
+
+```json
+{
+  "left_frame_count": 3,
+  "right_frame_count": 3,
+  "match_threshold": 4,
+  "gap_open_cost": 5,
+  "gap_per_frame_cost": 2,
+  "operations": "MMLR",
+  "step_count": 4,
+  "match_count": 2,
+  "left_only_count": 1,
+  "right_only_count": 1,
+  "steps": [
+    {"index": 1, "operation": "M", "left_id": "scanA-01", "right_id": "scanB-01", "distance": 0},
+    {"index": 2, "operation": "M", "left_id": "scanA-02", "right_id": "scanB-02", "distance": 1},
+    {"index": 3, "operation": "L", "left_id": "scanA-03", "right_id": null, "distance": null},
+    {"index": 4, "operation": "R", "left_id": null, "right_id": "scanB-03", "distance": null}
+  ],
+  "gap_segments": [
+    {"side": "L", "start_step": 3, "end_step": 3, "length": 1, "open_cost": 5, "per_frame_cost": 2, "cost": 7, "ids": ["scanA-03"]},
+    {"side": "R", "start_step": 4, "end_step": 4, "length": 1, "open_cost": 5, "per_frame_cost": 2, "cost": 7, "ids": ["scanB-03"]}
+  ],
+  "match_cost_total": 1,
+  "gap_cost_total": 14,
+  "total_cost": 15
+}
+```
+
+字段说明：
+
+- `operations`：完整操作串（`M`/`L`/`R`），与 `steps` 一一对应；
+  `step_count = 左帧数 + 右帧数 - 配对数`；
+- `steps[]`：逐步操作、取到的两侧帧 ID（未取到的一侧为 `null`）与配对
+  距离（仅 `M` 步非空）；
+- `gap_segments[]`：连续 L/R 段明细（`side`、`start_step`/`end_step`、
+  `length`、`cost` 与段内帧 `ids`），按起始步升序；
+- `match_cost_total` / `gap_cost_total`：配对距离之和与全部段成本之和，
+  `total_cost` 为两者之和（即全局最低成本）。
+
 ## 算法说明
 
 令 `span = last - first`，第 i 帧的指派帧号写作 `first + d_i`。
@@ -830,6 +940,20 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   窗口时该序保持单调，故子问题最优可转移），复杂度
   `O(m · max_window_length)`；
 - `setup_cost` 与窗口成本同样用 `Decimal` 精确计算。
+
+双扫描对齐（`solve_scan_alignment`）：
+
+- 经典的**仿射空隙代价**序列对齐：状态为当前格 `(i, j)` 加上最后一步的
+  侧别（M / L / R），从同侧状态续段只付逐帧成本，从异侧状态进入 L/R 需
+  另付开段成本，天然表达“换侧另开段、M 后重新开段”的规则；
+- 每个 DP 状态保存 `(成本, 操作串字节)` 二元组：操作按 `M=0、L=1、R=2`
+  编码为字节，使字节串的自然字典序恰好等价于裁决序 `M < L < R`，同状态
+  内同成本时直接取编码最小者即可；三条终态的 `(成本, 操作串)` 取最小即
+  为全局答案；
+- 配对可行性（汉明距离 ≤ 阈值）预先计算，哈希按 64 位整数异或后数比特；
+  复杂度 `O(左帧数 × 右帧数)`，100×100 约 3 万状态；
+- 任意输入恒可对齐（全 L + 全 R），故除参数非法（422）外不存在无解情形；
+  双空序列在 DP 起点即终止，返回空操作串与零成本。
 
 ## 本地开发（不使用 Docker）
 
