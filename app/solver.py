@@ -40,6 +40,13 @@ DAG：顶点为出现在某条最优序列中的 (帧, 帧号)，边为最优转
 核验帧数 = 区间族的最小命中集（经典贪心），数量相同时按位置序列字典序
 最小逐位构造。
 
+扫描比对（:func:`solve_scan_alignment`）是独立的仿射缺口双序列对齐：
+左右两条扫描序列按原序对齐，每步为配对 M（仅当两帧哈希的汉明距离不
+超过阈值，成本为该距离）、仅左 L 或仅右 R，每帧恰好出现一次；连续
+L/R 段成本 = 开段成本 + 段长 × 逐帧成本，换侧另开一段。用三状态后缀
+DP（上一步无未结算段 / 处于 L 段内 / 处于 R 段内）求最小总成本，再
+按操作串字典序（M < L < R）从前往后贪心回溯出字典序最小的最优操作串。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -108,6 +115,15 @@ DIRECTION_REVERSED = 1
 # 人工确认复核的边界
 MIN_CONFIRMATIONS = 1
 MAX_CONFIRMATIONS = 12
+
+# 扫描比对（双序列对齐）的边界
+MAX_ALIGNMENT_FRAMES = 100          # 每侧序列 0～100 帧
+MIN_MATCH_THRESHOLD = 0
+MAX_MATCH_THRESHOLD = 64            # 64 位哈希的最大汉明距离
+MIN_GAP_COST = Decimal("1")
+MAX_GAP_COST = Decimal("100")
+HASH_HEX_DIGITS = 16                # 16 位十六进制 = 64 位图像哈希
+_HEX_DIGIT_SET = frozenset("0123456789abcdefABCDEF")
 
 
 class ReviewError(Exception):
@@ -1362,4 +1378,258 @@ def solve_rescan_plan(payload: dict[str, Any]) -> dict[str, Any]:
         "window_count": len(result_windows),
         "total_cost": _json_number(total_cost),
         "windows": result_windows,
+    }
+
+
+# ---- 扫描比对（双序列对齐） ----
+
+
+def _parse_scan_frames(frames: Any, side_label: str) -> list[tuple[str, int]]:
+    """解析一侧扫描序列，返回 [(帧 ID, 哈希整数)]。
+
+    每帧需含序列内唯一的字符串 id 与 16 位十六进制 hash（大小写均可）；
+    哈希解析为 64 位整数，之后按位异或并数 1 的个数即得汉明距离。
+    """
+    parsed: list[tuple[str, int]] = []
+    seen_ids: set[str] = set()
+    for i, frame in enumerate(frames):
+        label = f"{side_label}第 {i + 1} 帧"
+        if not isinstance(frame, dict) or "id" not in frame:
+            raise InvalidRangeError(f"{label}缺少 id 字段")
+        frame_id = frame["id"]
+        if not isinstance(frame_id, str):
+            raise InvalidRangeError(f"{label}的 id 必须是字符串")
+        if frame_id in seen_ids:
+            raise InvalidRangeError(
+                f"{side_label}序列中帧 id {frame_id!r} 重复，id 必须在序列内唯一"
+            )
+        seen_ids.add(frame_id)
+        raw_hash = frame.get("hash")
+        if (
+            not isinstance(raw_hash, str)
+            or len(raw_hash) != HASH_HEX_DIGITS
+            or any(ch not in _HEX_DIGIT_SET for ch in raw_hash)
+        ):
+            raise InvalidRangeError(
+                f"帧 {frame_id!r} 的 hash 必须是 16 位十六进制字符串"
+            )
+        parsed.append((frame_id, int(raw_hash, 16)))
+    return parsed
+
+
+def solve_scan_alignment(payload: dict[str, Any]) -> dict[str, Any]:
+    """比对同卷胶片的两次扫描（带仿射缺口成本的双序列对齐）。
+
+    入参字段：
+        left / right: 0～100 帧的数组，按扫描原序排列，每帧
+            {id: 序列内唯一字符串, hash: 16 位十六进制}
+        match_threshold: int，0～64，允许配对的哈希汉明距离上限
+        gap_open_cost / gap_frame_cost: 1～100 的数值；连续 L/R 段成本
+            = gap_open_cost + 段长 × gap_frame_cost，换侧另开一段
+
+    对齐按原序进行，每步操作为 M（配对，成本 = 哈希汉明距离）、
+    L（仅左序列）或 R（仅右序列），每帧恰好出现一次。求总成本最小的
+    操作串；同分按操作串字典序（M < L < R）裁决。双空序列返回空操作
+    串与零成本。参数不合法时抛 InvalidRangeError。
+
+    实现：三状态后缀 DP。fM/fL/fR[i][j] 分别表示对齐 left[i:] 与
+    right[j:] 的最小成本，对应上一步为 M（或起始，无未结算段）、处于
+    L 段内、处于 R 段内；段成本在开段时一次性计入 gap_open_cost，段内
+    每帧计 gap_frame_cost。回溯时从前往后每步在保持后缀最优的前提下
+    依次尝试 M、L、R，即得字典序最小的最优操作串。
+    """
+    left_raw = payload.get("left")
+    right_raw = payload.get("right")
+    if not isinstance(left_raw, list) or len(left_raw) > MAX_ALIGNMENT_FRAMES:
+        raise InvalidRangeError(
+            f"left 必须是 0～{MAX_ALIGNMENT_FRAMES} 帧的数组"
+        )
+    if not isinstance(right_raw, list) or len(right_raw) > MAX_ALIGNMENT_FRAMES:
+        raise InvalidRangeError(
+            f"right 必须是 0～{MAX_ALIGNMENT_FRAMES} 帧的数组"
+        )
+
+    threshold = payload.get("match_threshold")
+    if (
+        not isinstance(threshold, int)
+        or isinstance(threshold, bool)
+        or not (MIN_MATCH_THRESHOLD <= threshold <= MAX_MATCH_THRESHOLD)
+    ):
+        raise InvalidRangeError(
+            f"match_threshold 必须是 "
+            f"{MIN_MATCH_THRESHOLD}～{MAX_MATCH_THRESHOLD} 的整数"
+        )
+
+    gap_open = _to_decimal(payload.get("gap_open_cost"), "gap_open_cost", "1～100")
+    if not (MIN_GAP_COST <= gap_open <= MAX_GAP_COST):
+        raise InvalidRangeError("gap_open_cost 必须在 1～100 之间")
+    gap_frame = _to_decimal(
+        payload.get("gap_frame_cost"), "gap_frame_cost", "1～100"
+    )
+    if not (MIN_GAP_COST <= gap_frame <= MAX_GAP_COST):
+        raise InvalidRangeError("gap_frame_cost 必须在 1～100 之间")
+
+    left = _parse_scan_frames(left_raw, "左侧")
+    right = _parse_scan_frames(right_raw, "右侧")
+    n = len(left)
+    m = len(right)
+
+    # 哈希汉明距离矩阵：64 位整数异或后数 1 的个数
+    dist = [
+        [(left_hash ^ right_hash).bit_count() for _rid, right_hash in right]
+        for _lid, left_hash in left
+    ]
+
+    # 三状态后缀 DP：fM/fL/fR[i][j] = 对齐 left[i:] 与 right[j:] 的最小
+    # 成本，分别对应上一步为 M（或起始，无未结算段）、处于 L 段内、处于
+    # R 段内。L/R 段在开段帧上一次性计入 gap_open，段内每帧计 gap_frame；
+    # 换侧或经 M 断开后再开段都重新计开段成本。
+    fM = [[Decimal(0)] * (m + 1) for _ in range(n + 1)]
+    fL = [[Decimal(0)] * (m + 1) for _ in range(n + 1)]
+    fR = [[Decimal(0)] * (m + 1) for _ in range(n + 1)]
+
+    def _min2(a: Decimal | None, b: Decimal) -> Decimal:
+        return b if a is None or b < a else a
+
+    for i in range(n, -1, -1):
+        for j in range(m, -1, -1):
+            if i == n and j == m:
+                continue
+            pair_cost: Decimal | None = None
+            if i < n and j < m and dist[i][j] <= threshold:
+                pair_cost = Decimal(dist[i][j]) + fM[i + 1][j + 1]
+
+            # 状态 M（无未结算段）：下一段 L / R 都要另开新段
+            best = pair_cost
+            if i < n:
+                best = _min2(best, gap_open + gap_frame + fL[i + 1][j])
+            if j < m:
+                best = _min2(best, gap_open + gap_frame + fR[i][j + 1])
+            assert best is not None  # i、j 不同时为边界，L/R 至少其一可行
+            fM[i][j] = best
+            # 状态 L（处于 L 段内）：续 L 不再计开段成本
+            best = pair_cost
+            if i < n:
+                best = _min2(best, gap_frame + fL[i + 1][j])
+            if j < m:
+                best = _min2(best, gap_open + gap_frame + fR[i][j + 1])
+            assert best is not None
+            fL[i][j] = best
+            # 状态 R（处于 R 段内）：续 R 不再计开段成本
+            best = pair_cost
+            if i < n:
+                best = _min2(best, gap_open + gap_frame + fL[i + 1][j])
+            if j < m:
+                best = _min2(best, gap_frame + fR[i][j + 1])
+            assert best is not None
+            fR[i][j] = best
+
+    total_cost = fM[0][0]
+
+    # 贪心回溯字典序最小（M < L < R）的最优操作串：每步在保持后缀最优
+    # （操作成本 + 后继状态最优值 == 当前状态最优值）的前提下优先取 M，
+    # 其次 L，最后 R。
+    operations: list[str] = []
+    steps: list[dict[str, Any]] = []
+    pair_count = 0
+    left_only_count = 0
+    right_only_count = 0
+    pair_cost_total = Decimal(0)
+    gap_cost_total = Decimal(0)
+
+    i = j = 0
+    state = 0  # 0=无未结算段（起始或上一步为 M），1=L 段内，2=R 段内
+    while i < n or j < m:
+        current = (fM, fL, fR)[state][i][j]
+        op: str | None = None
+        if (
+            i < n
+            and j < m
+            and dist[i][j] <= threshold
+            and Decimal(dist[i][j]) + fM[i + 1][j + 1] == current
+        ):
+            op = "M"
+        if op is None and i < n:
+            step_cost = gap_frame if state == 1 else gap_open + gap_frame
+            if step_cost + fL[i + 1][j] == current:
+                op = "L"
+        if op is None and j < m:
+            step_cost = gap_frame if state == 2 else gap_open + gap_frame
+            if step_cost + fR[i][j + 1] == current:
+                op = "R"
+        assert op is not None, "DP 保证每个状态至少有一种最优操作"
+
+        if op == "M":
+            distance = dist[i][j]
+            step_cost = Decimal(distance)
+            pair_count += 1
+            pair_cost_total += step_cost
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "op": "M",
+                    "left_id": left[i][0],
+                    "right_id": right[j][0],
+                    "distance": distance,
+                    "cost": _json_number(step_cost),
+                }
+            )
+            i += 1
+            j += 1
+            state = 0
+        elif op == "L":
+            step_cost = gap_frame if state == 1 else gap_open + gap_frame
+            left_only_count += 1
+            gap_cost_total += step_cost
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "op": "L",
+                    "left_id": left[i][0],
+                    "right_id": None,
+                    "distance": None,
+                    "cost": _json_number(step_cost),
+                }
+            )
+            i += 1
+            state = 1
+        else:
+            step_cost = gap_frame if state == 2 else gap_open + gap_frame
+            right_only_count += 1
+            gap_cost_total += step_cost
+            steps.append(
+                {
+                    "index": len(steps) + 1,
+                    "op": "R",
+                    "left_id": None,
+                    "right_id": right[j][0],
+                    "distance": None,
+                    "cost": _json_number(step_cost),
+                }
+            )
+            j += 1
+            state = 2
+        operations.append(op)
+
+    assert pair_cost_total + gap_cost_total == total_cost, (
+        "逐步成本合计与 DP 最优总成本不一致"
+    )
+    assert pair_count + left_only_count == n, "左序列帧未被恰好消费一次"
+    assert pair_count + right_only_count == m, "右序列帧未被恰好消费一次"
+
+    return {
+        "match_threshold": threshold,
+        "gap_open_cost": _json_number(gap_open),
+        "gap_frame_cost": _json_number(gap_frame),
+        "left_count": n,
+        "right_count": m,
+        "operations": "".join(operations),
+        "step_count": len(steps),
+        "pair_count": pair_count,
+        "left_only_count": left_only_count,
+        "right_only_count": right_only_count,
+        "pair_cost_total": _json_number(pair_cost_total),
+        "gap_cost_total": _json_number(gap_cost_total),
+        "total_cost": _json_number(total_cost),
+        "steps": steps,
     }

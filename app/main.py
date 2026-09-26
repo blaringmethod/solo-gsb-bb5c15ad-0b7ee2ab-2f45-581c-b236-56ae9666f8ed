@@ -13,6 +13,8 @@ from app.schemas import (
     RescanPlanResponse,
     ReviewRequest,
     ReviewResponse,
+    ScanAlignmentRequest,
+    ScanAlignmentResponse,
     StripDirectionReviewRequest,
     StripDirectionReviewResponse,
     VerificationPlanResponse,
@@ -26,6 +28,7 @@ from app.solver import (
     solve_confirmed_frame_review,
     solve_rescan_plan,
     solve_review,
+    solve_scan_alignment,
     solve_strip_directions,
     solve_verification_plan,
 )
@@ -46,8 +49,12 @@ app = FastAPI(
         "人工确认复核接口则接收 1～12 条人工确认帧，把对应位置钉死为"
         "确认帧号（未命中候选仍按推断计价），在确认约束下求最低代价指派，"
         "确认导致无解时返回不可再删减的冲突确认集。"
+        "扫描比对接口对同卷胶片的两次扫描做双序列对齐：按原序以配对 M、"
+        "仅左 L、仅右 R 三种操作对齐两条帧序列（配对要求哈希汉明距离不"
+        "超过阈值，连续 L/R 段按开段成本加逐帧成本计费），"
+        "求总成本最低、同分操作串字典序最小的对齐方案。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -187,3 +194,15 @@ async def review_strip_directions(
 async def plan_rescan(request: RescanPlanRequest) -> RescanPlanResponse:
     result = solve_rescan_plan(request.model_dump())
     return RescanPlanResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/scan-alignments",
+    response_model=ScanAlignmentResponse,
+    tags=["alignment"],
+    summary="比对同卷胶片的两次扫描（双序列对齐）",
+    responses={422: {"model": ErrorResponse, "description": "参数非法"}},
+)
+async def align_scans(request: ScanAlignmentRequest) -> ScanAlignmentResponse:
+    result = solve_scan_alignment(request.model_dump())
+    return ScanAlignmentResponse.model_validate(result)

@@ -292,6 +292,83 @@ class ConflictingConfirmationOut(BaseModel):
     frame_number: int = Field(..., description="该位置被人工确认的帧号")
 
 
+class ScanFrameIn(BaseModel):
+    id: str = Field(..., description="序列内唯一的帧标识（字符串）")
+    hash: str = Field(
+        ...,
+        pattern=r"^[0-9a-fA-F]{16}$",
+        description="16 位十六进制图像哈希（64 位，大小写均可），由调用方提供",
+    )
+
+
+class ScanAlignmentRequest(BaseModel):
+    match_threshold: int = Field(
+        ..., ge=0, le=64, description="允许配对的哈希汉明距离上限，0～64"
+    )
+    gap_open_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="每开启一个 L/R 段的固定成本，1～100"
+    )
+    gap_frame_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="L/R 段内每帧的成本，1～100"
+    )
+    left: list[ScanFrameIn] = Field(
+        ..., max_length=100, description="第一次扫描的帧序列（0～100 帧，按原序）"
+    )
+    right: list[ScanFrameIn] = Field(
+        ..., max_length=100, description="第二次扫描的帧序列（0～100 帧，按原序）"
+    )
+
+
+class AlignmentStepOut(BaseModel):
+    index: int = Field(..., description="步骤序号，从 1 开始")
+    op: Literal["M", "L", "R"] = Field(
+        ..., description="M=配对，L=仅左序列，R=仅右序列"
+    )
+    left_id: Union[str, None] = Field(
+        ..., description="该步消耗的左序列帧 ID；R 步骤为 null"
+    )
+    right_id: Union[str, None] = Field(
+        ..., description="该步消耗的右序列帧 ID；L 步骤为 null"
+    )
+    distance: Union[int, None] = Field(
+        ..., description="配对两帧哈希的汉明距离；仅 M 步骤有值"
+    )
+    cost: Union[int, float] = Field(
+        ...,
+        description=(
+            "该步的边际成本：M=汉明距离；L/R=段内计费"
+            "（开段帧=开段成本+逐帧成本，续段帧=逐帧成本）"
+        ),
+    )
+
+
+class ScanAlignmentResponse(BaseModel):
+    match_threshold: int
+    gap_open_cost: Union[int, float]
+    gap_frame_cost: Union[int, float]
+    left_count: int
+    right_count: int
+    operations: str = Field(
+        ..., description="完整操作串（M/L/R），如 MMLR；双空序列时为空串"
+    )
+    step_count: int = Field(..., description="操作步数，即 operations 的长度")
+    pair_count: int = Field(..., description="配对（M）步数")
+    left_only_count: int = Field(..., description="仅左（L）步数")
+    right_only_count: int = Field(..., description="仅右（R）步数")
+    pair_cost_total: Union[int, float] = Field(
+        ..., description="全部配对步的汉明距离成本合计"
+    )
+    gap_cost_total: Union[int, float] = Field(
+        ..., description="全部 L/R 段成本合计（含开段成本）"
+    )
+    total_cost: Union[int, float] = Field(
+        ..., description="全局最低总成本；双空序列时为 0"
+    )
+    steps: list[AlignmentStepOut] = Field(
+        ..., description="逐步操作明细（操作、对应帧 ID、配对距离、边际成本）"
+    )
+
+
 class ErrorResponse(BaseModel):
     error: Literal[
         "invalid_range",
